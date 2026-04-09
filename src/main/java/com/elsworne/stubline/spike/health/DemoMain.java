@@ -60,6 +60,26 @@ public final class DemoMain {
                   3))
         System.out.printf("%s\t%s\t%d%n", result.url(), result.status(), result.latencyMillis());
       System.out.println("TOTAL_MS\t" + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
+      var slow =
+          java.util.stream.IntStream.range(0, 50).mapToObj(i -> URI.create(base + "/ok")).toList();
+      for (var entry :
+          java.util.Map.of(
+                  "fixed",
+                  Checkers.fixedPool(),
+                  "virtual",
+                  Checkers.virtualThreads(),
+                  "async",
+                  Checkers.async())
+              .entrySet()) {
+        long compared = System.nanoTime();
+        var results =
+            entry.getValue().check(slow, Duration.ofSeconds(2), Duration.ofSeconds(10), 10);
+        System.out.printf(
+            "%s endpoints=%d totalMs=%d%n",
+            entry.getKey(),
+            results.size(),
+            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - compared));
+      }
       server.stop(0);
     } finally {
       server.stop(0);

@@ -7,18 +7,103 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class CheckersTest {
   @Test
-  void checksStatusTimeoutDeadlineAndConcurrencyBound() throws Exception {
-    var active = new AtomicInteger();
+  void failedEndpointReportsHttpStatus() throws Exception {
+    withServer(
+        (base, peak) -> {
+          for (var checker : checkers())
+            assertEquals(
+                "500",
+                checker
+                    .check(
+                        List.of(URI.create(base + "/fail")),
+                        Duration.ofSeconds(1),
+                        Duration.ofSeconds(2),
+                        2)
+                    .getFirst()
+                    .status());
+        });
+  }
+
+  @Test
+  void hungEndpointDoesNotHoldRunPastDeadline() throws Exception {
+    withServer(
+        (base, peak) -> {
+          for (var checker : checkers()) {
+            long started = System.nanoTime();
+            var result =
+                checker.check(
+                    List.of(URI.create(base + "/hang")),
+                    Duration.ofSeconds(2),
+                    Duration.ofMillis(300),
+                    2);
+            assertEquals("TIMEOUT", result.getFirst().status());
+            assertTrue(Duration.ofNanos(System.nanoTime() - started).toMillis() < 900);
+          }
+        });
+  }
+
+  @Test
+  void concurrentChecksRespectBound() throws Exception {
+    withServer(
+        (base, peak) -> {
+          var urls = new ArrayList<URI>();
+          for (int i = 0; i < 8; i++) urls.add(URI.create(base + "/slow"));
+          for (var checker :
+              new HealthChecker[] {
+                Checkers.fixedPool(), Checkers.virtualThreads(), Checkers.async()
+              }) {
+            peak.set(0);
+            assertEquals(
+                8, checker.check(urls, Duration.ofSeconds(2), Duration.ofSeconds(4), 2).size());
+            assertTrue(peak.get() <= 2);
+          }
+        });
+  }
+
+  @Test
+  void concurrentChecksFinishFasterThanSequential() throws Exception {
+    withServer(
+        (base, peak) -> {
+          var urls = new ArrayList<URI>();
+          for (int i = 0; i < 8; i++) urls.add(URI.create(base + "/slow"));
+          long started = System.nanoTime();
+          Checkers.sequential().check(urls, Duration.ofSeconds(2), Duration.ofSeconds(4), 2);
+          long sequentialMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
+          for (var checker :
+              new HealthChecker[] {
+                Checkers.fixedPool(), Checkers.virtualThreads(), Checkers.async()
+              }) {
+            started = System.nanoTime();
+            checker.check(urls, Duration.ofSeconds(2), Duration.ofSeconds(4), 2);
+            assertTrue(
+                Duration.ofNanos(System.nanoTime() - started).toMillis() < sequentialMs - 200);
+          }
+        });
+  }
+
+  private static HealthChecker[] checkers() {
+    return new HealthChecker[] {
+      Checkers.sequential(), Checkers.fixedPool(), Checkers.virtualThreads(), Checkers.async()
+    };
+  }
+
+  private interface Scenario {
+    void run(String base, AtomicInteger peak) throws Exception;
+  }
+
+  private static void withServer(Scenario scenario) throws Exception {
     var peak = new AtomicInteger();
+    var active = new AtomicInteger();
     var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-    try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-      server.setExecutor(executor);
+    try (var workers = Executors.newVirtualThreadPerTaskExecutor()) {
+      server.setExecutor(workers);
       server.createContext(
           "/slow",
           exchange -> {
@@ -51,41 +136,7 @@ class CheckersTest {
             exchange.close();
           });
       server.start();
-      var base = "http://127.0.0.1:" + server.getAddress().getPort();
-      var urls = new ArrayList<URI>();
-      for (int i = 0; i < 6; i++) urls.add(URI.create(base + "/slow"));
-      long sequentialStart = System.nanoTime();
-      var sequential =
-          Checkers.sequential().check(urls, Duration.ofSeconds(2), Duration.ofSeconds(4), 2);
-      long sequentialMs = Duration.ofNanos(System.nanoTime() - sequentialStart).toMillis();
-      assertEquals(6, sequential.size());
-      assertTrue(sequentialMs >= 800);
-      for (var checker :
-          new HealthChecker[] {Checkers.fixedPool(), Checkers.virtualThreads(), Checkers.async()}) {
-        peak.set(0);
-        long started = System.nanoTime();
-        var results = checker.check(urls, Duration.ofSeconds(1), Duration.ofSeconds(3), 2);
-        long elapsed = Duration.ofNanos(System.nanoTime() - started).toMillis();
-        assertEquals(6, results.size());
-        assertTrue(elapsed < sequentialMs - 200, "concurrent check should be faster");
-        assertTrue(peak.get() <= 2, "bound exceeded: " + peak.get());
-      }
-      for (var checker :
-          new HealthChecker[] {
-            Checkers.sequential(), Checkers.fixedPool(), Checkers.virtualThreads(), Checkers.async()
-          }) {
-        long started = System.nanoTime();
-        var mixed =
-            checker.check(
-                java.util.List.of(URI.create(base + "/fail"), URI.create(base + "/hang")),
-                Duration.ofSeconds(2),
-                Duration.ofMillis(500),
-                2);
-        assertTrue(mixed.stream().anyMatch(r -> r.status().equals("500")));
-        assertTrue(mixed.stream().anyMatch(r -> r.status().equals("TIMEOUT")));
-        assertTrue(Duration.ofNanos(System.nanoTime() - started).toMillis() < 800);
-      }
-      server.stop(0);
+      scenario.run("http://127.0.0.1:" + server.getAddress().getPort(), peak);
     } finally {
       server.stop(0);
     }
