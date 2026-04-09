@@ -78,7 +78,7 @@ class CheckersTest {
         var mixed =
             checker.check(
                 java.util.List.of(URI.create(base + "/fail"), URI.create(base + "/hang")),
-                Duration.ofMillis(300),
+                Duration.ofSeconds(2),
                 Duration.ofMillis(500),
                 2);
         assertTrue(mixed.stream().anyMatch(r -> r.status().equals("500")));

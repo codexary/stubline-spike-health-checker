@@ -63,7 +63,14 @@ public final class Checkers {
                     try {
                       permits.acquire();
                       long start = System.nanoTime();
-                      var request = HttpRequest.newBuilder(url).timeout(perRequest).build();
+                      if (start >= until) {
+                        permits.release();
+                        return new CheckResult(url, "TIMEOUT", 0);
+                      }
+                      var request =
+                          HttpRequest.newBuilder(url)
+                              .timeout(min(perRequest, Duration.ofNanos(until - start)))
+                              .build();
                       return http.sendAsync(request, HttpResponse.BodyHandlers.discarding())
                           .orTimeout(
                               Math.min(
