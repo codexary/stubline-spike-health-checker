@@ -53,47 +53,52 @@ public final class Checkers {
   public static HealthChecker async() {
     return (urls, perRequest, deadline, bound) -> {
       try (var http = HttpClient.newHttpClient()) {
-        var permits = new Semaphore(bound);
         long until = System.nanoTime() + deadline.toNanos();
         var futures = new ArrayList<CompletableFuture<CheckResult>>();
+        var slots = new ArrayList<CompletableFuture<CheckResult>>();
+        for (int i = 0; i < bound; i++) slots.add(CompletableFuture.completedFuture(null));
+        int index = 0;
         for (URI url : urls) {
-          futures.add(
-              CompletableFuture.supplyAsync(
-                  () -> {
-                    try {
-                      permits.acquire();
-                      long start = System.nanoTime();
-                      if (start >= until) {
-                        permits.release();
-                        return new CheckResult(url, "TIMEOUT", 0);
-                      }
-                      var request =
-                          HttpRequest.newBuilder(url)
-                              .timeout(min(perRequest, Duration.ofNanos(until - start)))
-                              .build();
-                      return http.sendAsync(request, HttpResponse.BodyHandlers.discarding())
-                          .orTimeout(
-                              Math.min(
-                                  perRequest.toMillis(),
-                                  Math.max(1, TimeUnit.NANOSECONDS.toMillis(until - start))),
-                              TimeUnit.MILLISECONDS)
-                          .handle(
-                              (response, error) ->
-                                  new CheckResult(
-                                      url,
-                                      error == null
-                                          ? Integer.toString(response.statusCode())
-                                          : classify(error),
-                                      elapsed(start)))
-                          .whenComplete((result, error) -> permits.release())
-                          .join();
-                    } catch (InterruptedException e) {
-                      Thread.currentThread().interrupt();
-                      return new CheckResult(url, "TIMEOUT", 0);
-                    }
-                  }));
+          int slot = index++ % bound;
+          var future =
+              slots
+                  .get(slot)
+                  .thenCompose(
+                      ignored -> {
+                        long start = System.nanoTime();
+                        if (start >= until)
+                          return CompletableFuture.completedFuture(
+                              new CheckResult(url, "TIMEOUT", 0));
+                        var timeout = min(perRequest, Duration.ofNanos(until - start));
+                        var request = HttpRequest.newBuilder(url).timeout(timeout).build();
+                        return http.sendAsync(request, HttpResponse.BodyHandlers.discarding())
+                            .orTimeout(Math.max(1, timeout.toMillis()), TimeUnit.MILLISECONDS)
+                            .handle(
+                                (response, error) ->
+                                    new CheckResult(
+                                        url,
+                                        error == null
+                                            ? Integer.toString(response.statusCode())
+                                            : classify(error),
+                                        elapsed(start)));
+                      });
+          slots.set(slot, future);
+          futures.add(future);
         }
-        return collect(urls, futures, until);
+        CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new))
+            .orTimeout(Math.max(1, until - System.nanoTime()), TimeUnit.NANOSECONDS)
+            .exceptionally(ignored -> null)
+            .join();
+        var results = new ArrayList<CheckResult>();
+        for (int i = 0; i < futures.size(); i++) {
+          var future = futures.get(i);
+          results.add(
+              future.isCompletedExceptionally()
+                  ? new CheckResult(urls.get(i), "TIMEOUT", 0)
+                  : future.getNow(new CheckResult(urls.get(i), "TIMEOUT", 0)));
+          if (!future.isDone()) future.cancel(true);
+        }
+        return sorted(results);
       }
     };
   }
